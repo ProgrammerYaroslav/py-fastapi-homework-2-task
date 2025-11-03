@@ -1,88 +1,80 @@
 import datetime
-from enum import Enum
-from pydantic import BaseModel, ConfigDict, field_validator, confloat, constr
-from typing import List, Optional
+from typing import List, Optional, Literal
+
+from pydantic import BaseModel, Field, ConfigDict, model_validator
+
+# =============================================================================
+# Reusable Schemas for Related Models
+# =============================================================================
+
+class CountryResponse(BaseModel):
+    """Schema for country details in a response."""
+    id: int
+    code: str
+    name: Optional[str] = None
+    
+    model_config = ConfigDict(from_attributes=True)
 
 
-class MovieStatusEnum(str, Enum):
-    """Enumeration for movie production statuses."""
-    RELEASED = "Released"
-    POST_PRODUCTION = "Post Production"
-    IN_PRODUCTION = "In Production"
+class GenreResponse(BaseModel):
+    """Schema for genre details in a response."""
+    id: int
+    name: str
+
+    model_config = ConfigDict(from_attributes=True)
 
 
-class MovieShortResponse(BaseModel):
-    """Schema for a movie item in a paginated list."""
+class ActorResponse(BaseModel):
+    """Schema for actor details in a response."""
+    id: int
+    name: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class LanguageResponse(BaseModel):
+    """Schema for language details in a response."""
+    id: int
+    name: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MessageResponse(BaseModel):
+    """A generic message response schema."""
+    detail: str
+
+
+# =============================================================================
+# Schemas for Task 1: GET /movies/ (List Movies)
+# =============================================================================
+
+class MovieBriefResponse(BaseModel):
+    """Schema for a single movie in a paginated list."""
     id: int
     name: str
     date: datetime.date
     score: float
     overview: str
-
+    
     model_config = ConfigDict(from_attributes=True)
 
 
-class MoviesListResponse(BaseModel):
-    """Schema for the paginated list of movies response."""
-    movies: List[MovieShortResponse]
+class PaginatedMovieResponse(BaseModel):
+    """Schema for the paginated movie list response."""
+    movies: List[MovieBriefResponse]
     prev_page: Optional[str] = None
     next_page: Optional[str] = None
     total_pages: int
     total_items: int
 
 
-class CountrySchema(BaseModel):
-    id: int
-    code: str
-    name: Optional[str] = None
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class GenreSchema(BaseModel):
-    id: int
-    name: str
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class ActorSchema(BaseModel):
-    id: int
-    name: str
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class LanguageSchema(BaseModel):
-    id: int
-    name: str
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class MovieCreateRequest(BaseModel):
-    name: constr(max_length=255)
-    date: datetime.date
-    score: confloat(ge=0, le=100)
-    overview: str
-    status: MovieStatusEnum
-    budget: confloat(ge=0)
-    revenue: confloat(ge=0)
-    country: str  # ISO 3166-1 alpha-3 code
-    genres: List[str]
-    actors: List[str]
-    languages: List[str]
-
-    @field_validator('date')
-    @classmethod
-    def validate_date(cls, v: datetime.date) -> datetime.date:
-        """Validate that the date is not more than one year in the future."""
-        if v > datetime.date.today() + datetime.timedelta(days=365):
-            raise ValueError("Date cannot be more than one year in the future")
-        return v
-
+# =============================================================================
+# Schemas for Task 2 (POST) & 3 (GET by ID)
+# =============================================================================
 
 class MovieDetailResponse(BaseModel):
+    """Schema for the detailed movie response (used for create and get-by-id)."""
     id: int
     name: str
     date: datetime.date
@@ -91,23 +83,46 @@ class MovieDetailResponse(BaseModel):
     status: str
     budget: float
     revenue: float
-    country: CountrySchema
-    genres: List[GenreSchema]
-    actors: List[ActorSchema]
-    languages: List[LanguageSchema]
+    country: CountryResponse
+    genres: List[GenreResponse]
+    actors: List[ActorResponse]
+    languages: List[LanguageResponse]
 
     model_config = ConfigDict(from_attributes=True)
 
 
+class MovieCreateRequest(BaseModel):
+    """Schema for the movie creation request body."""
+    name: str = Field(..., max_length=255)
+    date: datetime.date
+    score: float = Field(..., ge=0, le=100)
+    overview: str
+    status: Literal["Released", "Post Production", "In Production"]
+    budget: float = Field(..., ge=0)
+    revenue: float = Field(..., ge=0)
+    country: str = Field(..., description="ISO 3166-1 alpha-3 code")
+    genres: List[str]
+    actors: List[str]
+    languages: List[str]
+
+    @model_validator(mode='after')
+    def validate_date(self) -> 'MovieCreateRequest':
+        """Validate that the movie date is not more than one year in the future."""
+        if self.date > (datetime.date.today() + datetime.timedelta(days=365)):
+            raise ValueError("Release date cannot be more than one year in the future")
+        return self
+
+
+# =============================================================================
+# Schemas for Task 5: PATCH /movies/{movie_id} (Update Movie)
+# =============================================================================
+
 class MovieUpdateRequest(BaseModel):
-    name: Optional[constr(max_length=255)] = None
+    """Schema for the movie update request body (all fields optional)."""
+    name: Optional[str] = Field(None, max_length=255)
     date: Optional[datetime.date] = None
-    score: Optional[confloat(ge=0, le=100)] = None
+    score: Optional[float] = Field(None, ge=0, le=100)
     overview: Optional[str] = None
-    status: Optional[MovieStatusEnum] = None
-    budget: Optional[confloat(ge=0)] = None
-    revenue: Optional[confloat(ge=0)] = None
-
-
-class MovieUpdateResponse(BaseModel):
-    detail: str = "Movie updated successfully."
+    status: Optional[Literal["Released", "Post Production", "In Production"]] = None
+    budget: Optional[float] = Field(None, ge=0)
+    revenue: Optional[float] = Field(None, ge=0)

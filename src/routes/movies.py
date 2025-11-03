@@ -1,63 +1,90 @@
 import math
 from typing import List, Type
 
-from fastapi import (
-    APIRouter,
-    Depends,
-    HTTPException,
-    Query,
-    Request,
-    Response,
-    status,
-)
-from sqlalchemy import select, func, and_
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import joinedload, selectinload, QueryableAttribute
+from sqlalchemy.future import select
+from sqlalchemy.orm import joinedload, selectinload
+from sqlalchemy import func, exc
 
-# Make sure this import is correct (from the previous step)
-from database import get_db
+# Import database session, models, and schemas
+from database.session_postgresql import get_db
 from database.models import (
     MovieModel,
+    CountryModel,
     GenreModel,
     ActorModel,
-    CountryModel,
     LanguageModel,
 )
 from schemas.movies import (
-    MoviesListResponse,
-    MovieCreateRequest,
+    PaginatedMovieResponse,
+    MovieBriefResponse,
     MovieDetailResponse,
+    MovieCreateRequest,
     MovieUpdateRequest,
-    MovieUpdateResponse,
+    MessageResponse,
 )
 
-router = APIRouter()
+router = APIRouter(prefix="/movies", tags=["Movies"])
 
+# =============================================================================
+# Helper Functions
+# =============================================================================
 
-# --- Helper Functions ---
-
-async def get_or_create_related_instance(
-    db: AsyncSession, model: Type, name: str
-) -> Type:
+async def _get_or_create_country(code: str, db: AsyncSession) -> CountryModel:
     """
-    Retrieves a related entity (Genre, Actor, Language) by name,
-    or creates it if it doesn't exist.
+    Retrieve a country by its code, or create it if it doesn't exist.
     """
-    query = select(model).where(model.name == name)
+    query = select(CountryModel).where(CountryModel.code == code)
     result = await db.execute(query)
-    instance = result.scalar_one_or_none()
+    country = result.scalar_one_or_none()
+    
+    if not country:
+        country = CountryModel(code=code, name=None)  # Name can be populated later
+        db.add(country)
+        await db.flush()  # Flush to get the ID before commit
+        await db.refresh(country)
+    return country
 
-    if not instance:
-        instance = model(name=name)
-        db.add(instance)
-        await db.flush()  # Flush to get the ID without committing
-    return instance
 
-
-async def get_movie_by_id(movie_id: int, db: AsyncSession) -> MovieModel | None:
+async def _get_or_create_related_list(
+    names: List[str], 
+    model: Type[GenreModel] | Type[ActorModel] | Type[LanguageModel], 
+    db: AsyncSession
+) -> List[GenreModel | ActorModel | LanguageModel]:
     """
-    Retrieves a single movie by its ID, eagerly loading all
-    related entities for a detailed response.
+    Generic helper to get or create related entities (Genres, Actors, Languages).
+    """
+    objects = []
+    
+    # First, find existing objects
+    existing_query = select(model).where(model.name.in_(names))
+    existing_result = await db.execute(existing_query)
+    existing_map = {obj.name: obj for obj in existing_result.scalars()}
+    
+    for name in names:
+        if name in existing_map:
+            objects.append(existing_map[name])
+        else:
+            # Create new one if it doesn't exist
+            new_obj = model(name=name)
+            db.add(new_obj)
+            objects.append(new_obj)
+            
+    # Flush to get IDs for new objects
+    if len(objects) > len(existing_map):
+        await db.flush()
+        for obj in objects:
+            if not obj.id:
+                await db.refresh(obj)
+                
+    return objects
+
+
+async def _get_movie_details_by_id(movie_id: int, db: AsyncSession) -> MovieModel:
+    """
+    Retrieve a single movie by ID with all relationships eagerly loaded.
+    Raises 404 if not found.
     """
     query = (
         select(MovieModel)
@@ -70,40 +97,50 @@ async def get_movie_by_id(movie_id: int, db: AsyncSession) -> MovieModel | None:
         )
     )
     result = await db.execute(query)
-    return result.scalar_one_or_none()
+    movie = result.scalar_one_or_none()
+    
+    if not movie:
+        raise HTTPException(
+            status_code=404, 
+            detail="Movie with the given ID was not found."
+        )
+    return movie
 
 
-# --- Task 1: Implement Movies List Endpoint ---
+# =============================================================================
+# Endpoint Implementations
+# =============================================================================
 
 @router.get(
-    "/movies/",
-    response_model=MoviesListResponse,
-    status_code=status.HTTP_200_OK,
+    "/",
+    response_model=PaginatedMovieResponse,
+    summary="Get Paginated List of Movies"
 )
-async def get_movies_list(
+async def get_movies(
     request: Request,
-    page: int = Query(default=1, ge=1),
-    per_page: int = Query(default=10, ge=1, le=20),
     db: AsyncSession = Depends(get_db),
+    page: int = Query(1, ge=1, description="Page number to retrieve"),
+    per_page: int = Query(10, ge=1, le=20, description="Items per page"),
 ):
     """
+    Task 1: Implement Movies List Endpoint
     Retrieves a paginated list of movies, sorted by ID in descending order.
     """
     offset = (page - 1) * per_page
-
-    # Query for the total count of movies
-    total_query = select(func.count(MovieModel.id))
-    total_result = await db.execute(total_query)
-    total_items = total_result.scalar_one()
-
-    if not total_items:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="No movies found."
-        )
-
+    
+    # Query for total items
+    count_query = select(func.count(MovieModel.id))
+    total_items = (await db.execute(count_query)).scalar_one()
+    
+    if total_items == 0:
+        raise HTTPException(status_code=404, detail="No movies found.")
+        
     total_pages = math.ceil(total_items / per_page)
+    
+    if page > total_pages:
+        raise HTTPException(status_code=404, detail="No movies found.")
 
-    # Query for the paginated list of movies
+    # Query for the paginated movies
     movies_query = (
         select(MovieModel)
         .order_by(MovieModel.id.desc())
@@ -113,26 +150,23 @@ async def get_movies_list(
     movies_result = await db.execute(movies_query)
     movies = movies_result.scalars().all()
 
-    if not movies:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="No movies found."
-        )
+    # Build base URL for pagination links
+    base_url = str(request.url_for('get_movies'))
 
-    # Build pagination URLs
-    # This URL path needs to match the test client's request path
-    base_url = "/api/v1/theater/movies/"  # <-- FIX: Trailing space removed
-    prev_page = (
-        f"{base_url}?page={page - 1}&per_page={per_page}" if page > 1 else None
-    )
+    # Build next and previous page URLs
     next_page = (
         f"{base_url}?page={page + 1}&per_page={per_page}"
         if page < total_pages
         else None
     )
+    prev_page = (
+        f"{base_url}?page={page - 1}&per_page={per_page}"
+        if page > 1
+        else None
+    )
 
-    # <-- FIX: This line (132) is now completely empty, no spaces
-    return MoviesListResponse(
-        movies=movies,
+    return PaginatedMovieResponse(
+        movies=[MovieBriefResponse.model_validate(m) for m in movies],
         prev_page=prev_page,
         next_page=next_page,
         total_pages=total_pages,
@@ -140,169 +174,153 @@ async def get_movies_list(
     )
 
 
-# --- Task 2: Implement Movie Creation Endpoint ---
-
 @router.post(
-    "/movies/",
+    "/",
     response_model=MovieDetailResponse,
-    status_code=status.HTTP_201_CREATED,
+    status_code=201,
+    summary="Create a New Movie"
 )
 async def create_movie(
-    movie_data: MovieCreateRequest, db: AsyncSession = Depends(get_db)
+    movie_data: MovieCreateRequest, 
+    db: AsyncSession = Depends(get_db)
 ):
     """
-    Creates a new movie in the database, including its related entities.
+    Task 2: Implement Movie Creation Endpoint
+    Creates a new movie and links/creates related entities.
     """
     # Check for duplicates
     duplicate_query = select(MovieModel).where(
-        and_(
-            MovieModel.name == movie_data.name,
-            MovieModel.date == movie_data.date
-        )
+        MovieModel.name == movie_data.name, 
+        MovieModel.date == movie_data.date
     )
-    duplicate_result = await db.execute(duplicate_query)
-    if duplicate_result.scalar_one_or_none():
+    existing_movie = (await db.execute(duplicate_query)).scalar_one_or_none()
+    
+    if existing_movie:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"A movie with the name '{movie_data.name}' and "
-                   f"release date '{movie_data.date}' already exists.",
+            status_code=409,
+            detail=f"A movie with the name '{movie_data.name}' and release date '{movie_data.date}' already exists."
         )
 
-    # Get or create Country
-    country_query = select(CountryModel).where(
-        CountryModel.code == movie_data.country
-    )
-    country_result = await db.execute(country_query)
-    country = country_result.scalar_one_or_none()
-    if not country:
-        # <-- FIX: Two spaces added before the '#'
-        country = CountryModel(code=movie_data.country, name=None)  # Added name=None for clarity
-        db.add(country)
-        await db.flush()
+    try:
+        # Handle related entities
+        country = await _get_or_create_country(movie_data.country, db)
+        genres = await _get_or_create_related_list(movie_data.genres, GenreModel, db)
+        actors = await _get_or_create_related_list(movie_data.actors, ActorModel, db)
+        languages = await _get_or_create_related_list(movie_data.languages, LanguageModel, db)
 
-    # Get or create Genres, Actors, and Languages
-    genres_list = [
-        await get_or_create_related_instance(db, GenreModel, name)
-        for name in movie_data.genres
-    ]
-    actors_list = [
-        await get_or_create_related_instance(db, ActorModel, name)
-        for name in movie_data.actors
-    ]
-    languages_list = [
-        await get_or_create_related_instance(db, LanguageModel, name)
-        for name in movie_data.languages
-    ]
+        # Create the new movie
+        new_movie = MovieModel(
+            **movie_data.model_dump(
+                exclude={'country', 'genres', 'actors', 'languages'}
+            )
+        )
+        
+        # Link related objects
+        new_movie.country = country
+        new_movie.genres = genres
+        new_movie.actors = actors
+        new_movie.languages = languages
+        
+        db.add(new_movie)
+        await db.commit()
+        
+        # Retrieve the full, detailed object for the response
+        return await _get_movie_details_by_id(new_movie.id, db)
 
-    # Create new MovieModel instance
-    new_movie = MovieModel(
-        name=movie_data.name,
-        date=movie_data.date,
-        score=movie_data.score,
-        overview=movie_data.overview,
-        status=movie_data.status.value,  # Use the enum's value
-        budget=movie_data.budget,
-        revenue=movie_data.revenue,
-        country=country,
-        genres=genres_list,
-        actors=actors_list,
-        languages=languages_list,
-    )
+    except exc.IntegrityError as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"Database error: {e.orig}")
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
-    db.add(new_movie)
-    await db.commit()
-    await db.refresh(new_movie)
-
-    # Re-fetch the movie with all relationships loaded for the response
-    created_movie = await get_movie_by_id(new_movie.id, db)
-    return created_movie
-
-
-# --- Task 3: Implement Movie Details Endpoint ---
 
 @router.get(
-    "/movies/{movie_id}/",
+    "/{movie_id}/",
     response_model=MovieDetailResponse,
-    status_code=status.HTTP_200_OK,
+    summary="Get Movie Details by ID"
 )
-async def get_movie_details(movie_id: int, db: AsyncSession = Depends(get_db)):
+async def get_movie_details(
+    movie_id: int, 
+    db: AsyncSession = Depends(get_db)
+):
     """
+    Task 3: Implement Movie Details Endpoint
     Retrieves detailed information for a single movie by its ID.
     """
-    movie = await get_movie_by_id(movie_id, db)
-
-    if not movie:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Movie with the given ID was not found.",
-        )
+    # The helper function handles the query and 404 logic
+    movie = await _get_movie_details_by_id(movie_id, db)
     return movie
 
 
-# --- Task 4: Implement Movie Deletion Endpoint ---
-
 @router.delete(
-    "/movies/{movie_id}/",
-    status_code=status.HTTP_204_NO_CONTENT,
+    "/{movie_id}/",
+    status_code=204,
+    summary="Delete a Movie by ID"
 )
-async def delete_movie(movie_id: int, db: AsyncSession = Depends(get_db)):
+async def delete_movie(
+    movie_id: int, 
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Deletes a specific movie by its ID.
+    Task 4: Implement Movie Deletion Endpoint
+    Deletes a movie by its ID.
     """
-    # Fetch the movie to ensure it exists before deleting
-    query = select(MovieModel).where(MovieModel.id == movie_id)
-    result = await db.execute(query)
-    movie = result.scalar_one_or_none()
-
+    # Use db.get for a simple primary key lookup
+    movie = await db.get(MovieModel, movie_id)
+    
     if not movie:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Movie with the given ID was not found.",
+            status_code=404, 
+            detail="Movie with the given ID was not found."
         )
-
+        
     await db.delete(movie)
     await db.commit()
+    
+    return Response(status_code=204)
 
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-# --- Task 5: Implement Movie Update Endpoint ---
 
 @router.patch(
-    "/movies/{movie_id}/",
-    response_model=MovieUpdateResponse,
-    status_code=status.HTTP_200_OK,
+    "/{movie_id}/",
+    response_model=MessageResponse,
+    summary="Update Movie Details by ID"
 )
 async def update_movie(
     movie_id: int,
     movie_data: MovieUpdateRequest,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db)
 ):
     """
-    Partially updates a specific movie's details by its ID.
+    Task 5: Implement Movie Update Endpoint
+    Updates a movie's details. Only updates fields provided in the request.
     """
-    # Fetch the movie
-    query = select(MovieModel).where(MovieModel.id == movie_id)
-    result = await db.execute(query)
-    movie = result.scalar_one_or_none()
-
+    # Use db.get for a simple primary key lookup
+    movie = await db.get(MovieModel, movie_id)
+    
     if not movie:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Movie with the given ID was not found.",
+            status_code=404, 
+            detail="Movie with the given ID was not found."
         )
 
-    # Get update data, excluding fields that were not provided
+    # Get update data, excluding fields that were not set in the request
     update_data = movie_data.model_dump(exclude_unset=True)
 
-    # Handle enum conversion if status is provided
-    if "status" in update_data and update_data["status"]:
-        update_data["status"] = update_data["status"].value
+    if not update_data:
+        # If no data is provided, it's a successful "no-op"
+        return MessageResponse(detail="Movie updated successfully.")
 
     # Apply updates
     for key, value in update_data.items():
         setattr(movie, key, value)
+        
+    try:
+        await db.commit()
+        await db.refresh(movie)
+    except exc.IntegrityError as e:
+        await db.rollback()
+        # This could happen if, for example, the update violates a constraint
+        raise HTTPException(status_code=400, detail=f"Invalid input data: {e.orig}")
 
-    await db.commit()
-
-    return MovieUpdateResponse(detail="Movie updated successfully.")
+    return MessageResponse(detail="Movie updated successfully.")
