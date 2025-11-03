@@ -100,7 +100,12 @@ class MovieCreateRequest(BaseModel):
     status: Literal["Released", "Post Production", "In Production"]
     budget: float = Field(..., ge=0)
     revenue: float = Field(..., ge=0)
-    country: str = Field(..., description="ISO 3166-1 alpha-3 code")
+    # --- FIX: Added pattern validation for ISO 3166-1 alpha-3 code ---
+    country: str = Field(
+        ..., 
+        description="ISO 3166-1 alpha-3 code", 
+        pattern=r"^[A-Z]{3}$"
+    )
     genres: List[str]
     actors: List[str]
     languages: List[str]
@@ -109,6 +114,7 @@ class MovieCreateRequest(BaseModel):
     def validate_date(self) -> 'MovieCreateRequest':
         """Validate that the movie date is not more than one year in the future."""
         if self.date > (datetime.date.today() + datetime.timedelta(days=365)):
+            # This error will be caught by the custom exception handler
             raise ValueError("Release date cannot be more than one year in the future")
         return self
 
@@ -126,3 +132,12 @@ class MovieUpdateRequest(BaseModel):
     status: Optional[Literal["Released", "Post Production", "In Production"]] = None
     budget: Optional[float] = Field(None, ge=0)
     revenue: Optional[float] = Field(None, ge=0)
+
+    # --- FIX: Added date validation for updates ---
+    @model_validator(mode='after')
+    def validate_date(self) -> 'MovieUpdateRequest':
+        """Validate that the movie date is not more than one year in the future."""
+        if self.date and self.date > (datetime.date.today() + datetime.timedelta(days=365)):
+            # This error will be caught by the custom exception handler
+            raise ValueError("Release date cannot be more than one year in the future")
+        return self

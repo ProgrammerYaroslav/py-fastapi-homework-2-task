@@ -150,8 +150,8 @@ async def get_movies(
     movies_result = await db.execute(movies_query)
     movies = movies_result.scalars().all()
 
-    # Build base URL for pagination links
-    base_url = str(request.url_for('get_movies'))
+    # --- FIX: Hard-code base URL to match /theater/movies/ requirement ---
+    base_url = "/theater/movies/"
 
     # Build next and previous page URLs
     next_page = (
@@ -178,7 +178,8 @@ async def get_movies(
     "/",
     response_model=MovieDetailResponse,
     status_code=201,
-    summary="Create a New Movie"
+    summary="Create a New Movie",
+    # --- NOTE: 400 response is now handled by the custom exception handler ---
 )
 async def create_movie(
     movie_data: MovieCreateRequest, 
@@ -227,11 +228,13 @@ async def create_movie(
         # Retrieve the full, detailed object for the response
         return await _get_movie_details_by_id(new_movie.id, db)
 
-    except exc.IntegrityError as e:
+    except exc.IntegrityError:
+        # --- FIX: Changed detail message to required string ---
         await db.rollback()
-        raise HTTPException(status_code=400, detail=f"Database error: {e.orig}")
+        raise HTTPException(status_code=400, detail="Invalid input data.")
     except Exception as e:
         await db.rollback()
+        # Fallback for other unexpected errors
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 
@@ -284,7 +287,8 @@ async def delete_movie(
 @router.patch(
     "/{movie_id}/",
     response_model=MessageResponse,
-    summary="Update Movie Details by ID"
+    summary="Update Movie Details by ID",
+    # --- NOTE: 400 response is now handled by the custom exception handler ---
 )
 async def update_movie(
     movie_id: int,
@@ -318,9 +322,9 @@ async def update_movie(
     try:
         await db.commit()
         await db.refresh(movie)
-    except exc.IntegrityError as e:
+    except exc.IntegrityError:
+        # --- FIX: Changed detail message to required string ---
         await db.rollback()
-        # This could happen if, for example, the update violates a constraint
-        raise HTTPException(status_code=400, detail=f"Invalid input data: {e.orig}")
+        raise HTTPException(status_code=400, detail="Invalid input data.")
 
     return MessageResponse(detail="Movie updated successfully.")
